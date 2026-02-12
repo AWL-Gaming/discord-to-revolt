@@ -3,10 +3,17 @@ import asyncio
 import time
 import random
 import re
+import os
 from collections import defaultdict, deque
+from pathlib import Path
+
+# Third-party libraries
 import requests
 import stoat as pyvolt
-from pathlib import Path
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
 
 TEMPLATE_IMPORT_STEPS = 5
 PROGRESS_FILE = "import_progress.json"
@@ -142,21 +149,28 @@ async def main():
             IDs["channels"].clear()
             print("🔄 Starting fresh...\n")
     
-    template_url = None
+    # --- 1. Get Template URL ---
+    template_url = os.getenv("DISCORD_TEMPLATE_URL")
     template = None
+    
     while not template:
-        template_url = input("Template URL: ").split("/")[-1]
-        if template_url == "":
+        if not template_url:
+            template_url = input("Template URL: ")
+            
+        template_code = template_url.split("/")[-1]
+        
+        if template_code == "":
             try:
                 template = json.load(open("demo_template.json"))["serialized_source_guild"]
                 break
             except:
                 print("❌ demo_template.json not found.")
+                template_url = None
                 continue
 
         try:
             headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
-            resp = requests.get(f"https://discord.com/api/v9/guilds/templates/{template_url}", headers=headers)
+            resp = requests.get(f"https://discord.com/api/v9/guilds/templates/{template_code}", headers=headers)
             if resp.status_code != 200:
                 print(f"❌ API Error: {resp.status_code}")
                 template_url = None
@@ -172,8 +186,14 @@ async def main():
     {len(template['channels'])} channels and {len(template['roles'])} roles will be imported.
     """)
     
-    target_server_id = input("Target Revolt Server ID: ")
-    bot_token = input("Revolt Bot Token: ")
+    # --- 2. Get Credentials ---
+    target_server_id = os.getenv("REVOLT_SERVER_ID")
+    if not target_server_id:
+        target_server_id = input("Target Revolt Server ID: ")
+        
+    bot_token = os.getenv("REVOLT_BOT_TOKEN")
+    if not bot_token:
+        bot_token = input("Revolt Bot Token: ")
     
     async with pyvolt.Client(token=bot_token, bot=True) as client:
         try:
@@ -398,7 +418,6 @@ async def main():
                 rRole = None
                 status = "Creating"
 
-                # Check if we should reuse
                 if role["id"] in IDs["roles"]:
                     rRole = next((r for r in existing_roles if r.id == IDs["roles"][role["id"]]), None)
                     if not rRole and role["name"] in existing_roles_by_name:
