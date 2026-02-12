@@ -25,7 +25,6 @@ cache = {"roles": {}, "channels": {}}
 
 # --- HELPER: Generate Valid Revolt IDs (ULIDs) ---
 def generate_ulid():
-    """Generates a valid ULID (26 chars) for Revolt categories"""
     t = int(time.time() * 1000)
     chars = []
     for _ in range(10):
@@ -57,50 +56,37 @@ class RawRole:
         return f"<RawRole id={self.id} name={self.name}>"
 
 def log(text, end="\n"):
-    """Instant logging helper that flushes stdout."""
+    """Instant output flushing"""
     print(text, end=end)
     sys.stdout.flush()
 
 def revolt_api_json(method: str, url: str, headers: dict, payload: dict | None = None, params: dict | None = None, timeout: int = 30):
-    """HTTP helper with SMART retry + 429 handling."""
+    """HTTP helper with retry + 429 handling."""
     for attempt in range(6):
         try:
             resp = requests.request(method, url, headers=headers, json=payload, params=params, timeout=timeout)
-            
-            # Rate Limit Handling
             if resp.status_code == 429:
-                retry_after = 1.0 # Default fallback
-                
-                # Check Standard Header (Seconds)
+                retry_after = 1.0
                 if "Retry-After" in resp.headers:
                     try: retry_after = float(resp.headers["Retry-After"])
                     except: pass
-                
-                # Check Revolt specific JSON body (Usually Milliseconds)
                 try:
                     data = resp.json()
                     json_retry = data.get("retry_after")
                     if json_retry:
                         val = float(json_retry)
-                        # Heuristic: If value is huge (>1000), it's milliseconds. 
-                        if val > 500: 
-                            val = val / 1000.0
-                        
-                        # Take the larger of the two to be safe
+                        if val > 500: val = val / 1000.0
                         retry_after = max(retry_after, val)
-                except:
-                    pass
+                except: pass
                 
                 log(f"    ⏳ Rate limit hit, waiting {retry_after:.2f}s...")
-                time.sleep(retry_after + 0.1) # Tiny buffer
+                time.sleep(retry_after + 0.1)
                 continue
             
-            # Server Error Handling
             if resp.status_code >= 500 and attempt < 5:
                 time.sleep(1)
                 continue
             
-            # Client Error Handling
             if resp.status_code >= 400:
                 return {"error": resp.text, "status": resp.status_code}
             
@@ -136,25 +122,21 @@ def build_existing_queues(current_channels):
     by_key = defaultdict(deque)
     by_name = defaultdict(deque)
     by_stripped = defaultdict(deque)
-    
     for ch in current_channels:
         name_raw = getattr(ch, "name", "")
         n = _norm_name(name_raw)
         s = _strip_name(name_raw)
         k = _revolt_channel_kind(ch)
-        
         by_key[(n, k)].append(ch)
         by_name[n].append(ch)
         if s: by_stripped[s].append(ch)
-        
     return by_key, by_name, by_stripped
 
 def save_progress(force=False):
     if not hasattr(save_progress, "counter"): save_progress.counter = 0
     save_progress.counter += 1
     if force or save_progress.counter % 10 == 0:
-        with open(PROGRESS_FILE, 'w') as f:
-            json.dump(IDs, f, indent=2)
+        with open(PROGRESS_FILE, 'w') as f: json.dump(IDs, f, indent=2)
     
 def load_progress():
     if Path(PROGRESS_FILE).exists():
@@ -165,14 +147,16 @@ def load_progress():
         return True
     return False
 
-def d2r(type, id):
-    return cache[type][IDs[type][id]]
-
 def step(current, total=None, text="Something is wrong"):
     log(("\t" if total else "") + f"[{current}/{total or TEMPLATE_IMPORT_STEPS}] {text}")
 
 def convert_permission(permissions: int):
-    d2r_map = {43:4, 40:8, 29:24, 28:3, 26:10, 27:11, 0:25, 1:6, 2:7, 4:0, 5:1, 6:29,10:20,11:22,13:23,14:26,15:27,16:21,20:30,21:31,23:34,22:33,24:35}
+    # Mapping Discord Permissions (Bit) -> Revolt Permissions (Bit)
+    # Based on community mappings
+    d2r_map = {
+        43:4, 40:8, 29:24, 28:3, 26:10, 27:11, 0:25, 1:6, 2:7, 4:0, 5:1,
+        6:29, 10:20, 11:22, 13:23, 14:26, 15:27, 16:21, 20:30, 21:31, 23:34, 22:33, 24:35
+    }
     out = 0
     if isinstance(permissions, str): permissions = int(permissions)
     for i in d2r_map:
@@ -180,7 +164,7 @@ def convert_permission(permissions: int):
     return pyvolt.Permissions(out)
 
 # ═══════════════════════════════════════════════════════
-#  CORE LOGIC: PROCESS ROLES (Responsive)
+#  ROLE PROCESSING (Centralized)
 # ═══════════════════════════════════════════════════════
 async def process_roles_logic(server, template, target_server_id, bot_token):
     log("    🔍 Fetching roles via Direct API...")
@@ -194,16 +178,12 @@ async def process_roles_logic(server, template, target_server_id, bot_token):
             lib_roles = await server.fetch_roles()
             raw_roles = [RawRole(r.id, {"name": r.name, "rank": r.rank, "colour": r.color, "hoist": r.hoist}) for r in lib_roles]
     except Exception as e:
-        log(f"    ❌ Failed: {e}")
-        return
+        log(f"    ❌ Failed: {e}"); return
 
-    log(f"    ✅ Found {len(raw_roles)} existing roles.")
-
-    # --- 1. DUPLICATE CLEANUP ---
-    log("    🧹 Analyzing duplicates...")
+    # Duplicate Cleanup
+    log(f"    ✅ Found {len(raw_roles)} existing roles. Checking duplicates...")
     roles_by_name = defaultdict(list)
-    for r in raw_roles:
-        roles_by_name[_norm_name(r.name)].append(r)
+    for r in raw_roles: roles_by_name[_norm_name(r.name)].append(r)
     
     ids_to_delete = []
     cleaned_roles = []
@@ -220,33 +200,26 @@ async def process_roles_logic(server, template, target_server_id, bot_token):
 
     if ids_to_delete:
         log(f"    🗑️  Deleting {len(ids_to_delete)} duplicate roles...")
-        
         for i, (rid, rname) in enumerate(ids_to_delete):
             revolt_api_json("DELETE", f"https://api.revolt.chat/servers/{target_server_id}/roles/{rid}", headers={"x-bot-token": bot_token})
-            
-            # RESPONSIVE LOGGING: Overwrite current line
             sys.stdout.write(f"\r       Deleted {i+1}/{len(ids_to_delete)} duplicates... ({rname})          ")
             sys.stdout.flush()
-            
         log(f"\n       ✅ Cleanup finished.        ")
 
     existing_roles_map = {_norm_name(r.name): r for r in cleaned_roles}
     
-    # --- 2. CREATE / REUSE ---
+    # Sync Logic
     template_everyone_id = None
     for r in template["roles"]:
         if r["name"] == "@everyone": template_everyone_id = r["id"]; break
     if template_everyone_id is None: template_everyone_id = template.get("id")
 
-    total_roles = len(template["roles"])
-    
     log("    ⚙️  Syncing roles...")
     for i, role in enumerate(template["roles"]):
         role_name = role["name"]
         norm_input_name = _norm_name(role_name)
         
         if role["id"] == template_everyone_id:
-            log(f"    [{i+1}/{total_roles}] @everyone -> Updating perms")
             await server.set_default_permissions(convert_permission(role["permissions"]))
             continue
 
@@ -256,65 +229,43 @@ async def process_roles_logic(server, template, target_server_id, bot_token):
         if role["id"] in IDs["roles"]:
             rid = IDs["roles"][role["id"]]
             found = next((r for r in cleaned_roles if r.id == rid), None)
-            if found: 
-                rRole = found
-                status = "Reusing"
+            if found: rRole = found; status = "Reusing"
         
         if not rRole and norm_input_name in existing_roles_map:
             rRole = existing_roles_map[norm_input_name]
             status = "Reusing"
 
         if status == "Creating" or i % 10 == 0:
-            log(f"    [{i+1}/{total_roles}] {role_name} -> {status}")
+            log(f"    [{i+1}/{len(template['roles'])}] {role_name} -> {status}")
 
         if not rRole:
             try:
-                payload = {
-                    "name": role["name"],
-                    "rank": role.get("position", 0)
-                }
+                payload = {"name": role["name"], "rank": role.get("position", 0)}
                 resp = revolt_api_json("POST", f"https://api.revolt.chat/servers/{target_server_id}/roles", headers={"x-bot-token": bot_token}, payload=payload)
-                
                 if isinstance(resp, dict) and "id" in resp:
-                    new_id = resp["id"]
-                    rRole = RawRole(new_id, {"name": role["name"], "rank": 0}) 
-                    new_raw = rRole
-                    cleaned_roles.append(new_raw)
-                    existing_roles_map[_norm_name(role["name"])] = new_raw
+                    rRole = RawRole(resp["id"], {"name": role["name"], "rank": 0}) 
+                    cleaned_roles.append(rRole)
+                    existing_roles_map[_norm_name(role["name"])] = rRole
                 else:
-                    log(f"      ❌ API Error creating role: {resp}")
-                    continue
-            except Exception as e:
-                log(f"      ❌ Create Failed: {e}")
-                continue
+                    log(f"      ❌ API Error: {resp}"); continue
+            except: continue
         else:
             # Optimization: Skip if colors match
             target_color = "#" + hex(role.get("color", 0))[2:].zfill(6)
             current_color = getattr(rRole, "color", None)
-            
             if current_color and current_color.lower() == target_color.lower():
                 IDs["roles"][role["id"]] = rRole.id
-                cache["roles"][rRole.id] = rRole
                 continue
-
-            if isinstance(rRole, RawRole):
-                try: rRole = await server.fetch_role(rRole.id)
-                except: continue
 
         if rRole:
             IDs["roles"][role["id"]] = rRole.id
-            cache["roles"][rRole.id] = rRole
-            
             try:
                 color = "#" + hex(role.get("color", 0))[2:].zfill(6)
                 await rRole.edit(color=color, hoist=role.get("hoist", False))
                 await server.set_role_permissions(rRole, allow=convert_permission(role["permissions"]), deny=pyvolt.Permissions(0))
             except: pass
-            
             save_progress()
-
     save_progress(force=True)
-
 
 async def main():
     has_progress = load_progress()
@@ -324,8 +275,7 @@ async def main():
         if resume != 'n':
             print("✅ Resuming from saved progress...\n")
         else:
-            IDs["roles"].clear()
-            IDs["channels"].clear()
+            IDs["roles"].clear(); IDs["channels"].clear()
             print("🔄 Starting fresh...\n")
     
     template_url = os.getenv("DISCORD_TEMPLATE_URL")
@@ -333,9 +283,6 @@ async def main():
     while not template:
         if not template_url: template_url = input("Template URL: ")
         code = template_url.split("/")[-1]
-        if not code:
-            try: template = json.load(open("demo_template.json"))["serialized_source_guild"]; break
-            except: print("❌ demo_template.json not found."); template_url=None; continue
         try:
             headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
             resp = requests.get(f"https://discord.com/api/v9/guilds/templates/{code}", headers=headers)
@@ -344,7 +291,6 @@ async def main():
         except: template_url=None
 
     print(f"Ready to import: {template['name']}")
-    
     target_server_id = os.getenv("REVOLT_SERVER_ID") or input("Target Revolt Server ID: ")
     bot_token = os.getenv("REVOLT_BOT_TOKEN") or input("Revolt Bot Token: ")
     
@@ -358,23 +304,16 @@ async def main():
         print("\n🔍 Scanning server...")
         current_channels = []
         try:
-            headers = {"x-bot-token": bot_token}
-            data = revolt_api_json("GET", f"https://api.revolt.chat/servers/{target_server_id}", headers=headers, params={"include_channels": "true"})
+            data = revolt_api_json("GET", f"https://api.revolt.chat/servers/{target_server_id}", headers={"x-bot-token": bot_token}, params={"include_channels": "true"})
             if isinstance(data, dict) and "channels" in data:
                 for d in data["channels"]:
                     if isinstance(d, dict): current_channels.append(RawChannel(d))
         except: pass
-        if not current_channels: 
-             if hasattr(server, 'channels'): current_channels = list(server.channels)
-
-        print(f"✅ Found {len(current_channels)} channels")
+        
         server_channel_ids = {ch.id for ch in current_channels}
         existing_by_key, existing_by_name_queue, existing_by_stripped_queue = build_existing_queues(current_channels)
         
-        print("\n1. 🚀 CATEGORIES ONLY")
-        print("2. 🔄 SMART MODE (Recommended)")
-        print("3. 🗑️  CLEAN SLATE")
-        print("4. 🎭 ROLES ONLY")
+        print("\n1. 🚀 CATEGORIES ONLY\n2. 🔄 SMART MODE (Recommended)\n3. 🗑️  CLEAN SLATE\n4. 🎭 ROLES ONLY")
         mode = input("Choose mode (1-4): ").strip()
 
         channels = template["channels"]
@@ -385,22 +324,17 @@ async def main():
         if mode == "4":
             step(1, 1, "Processing Roles")
             await process_roles_logic(server, template, target_server_id, bot_token)
-            print("\n✅ Role Sync Complete!")
-            return
+            print("\n✅ Role Sync Complete!"); return
 
         if mode == "3":
             step(1, text="Deleting channels")
             for ch in current_channels:
-                try:
-                    if isinstance(ch, RawChannel): requests.delete(f"https://api.revolt.chat/channels/{ch.id}", headers={"x-bot-token": bot_token})
-                    else: await ch.close()
+                try: requests.delete(f"https://api.revolt.chat/channels/{ch.id}", headers={"x-bot-token": bot_token})
                 except: pass
-            current_channels = []
+            current_channels = []; server_channel_ids = set()
             existing_by_key = defaultdict(deque); existing_by_name_queue = defaultdict(deque); existing_by_stripped_queue = defaultdict(deque)
-            server_channel_ids = set()
             IDs["channels"].clear(); IDs["roles"].clear()
-            save_progress(force=True)
-            mode = "2"
+            save_progress(force=True); mode = "2"
 
         if mode == "1" or mode == "2":
             step(2, text="Processing channels")
@@ -437,7 +371,7 @@ async def main():
                         if qs: chosen = qs.popleft()
 
                 if chosen:
-                    if i%5==0: step(i+1, total, f"{cname} ✓ reused")
+                    if i%10==0: step(i+1, total, f"{cname} ✓ reused")
                     IDs["channels"][cid] = chosen.id; used_revolt_ids.add(chosen.id); reused += 1; save_progress()
                     continue
                 
@@ -450,9 +384,6 @@ async def main():
                         )
                         IDs["channels"][cid] = rChannel.id; used_revolt_ids.add(rChannel.id); server_channel_ids.add(rChannel.id)
                         created += 1; save_progress()
-                    except pyvolt.HTTPException as e:
-                        if "TooManyChannels" in str(e): step(i+1, total, f"{cname} ⚠️ SERVER FULL"); skipped += 1
-                        else: log(f" ❌ Error: {e}"); skipped += 1
                     except: skipped += 1
 
             save_progress(force=True)
@@ -469,7 +400,6 @@ async def main():
                     if rid and rid in server_channel_ids and rid not in assigned:
                         assigned.add(rid); ch_ids.append(rid)
                 if ch_ids:
-                    log(f"    [Staged {i+1}/{len(categories)}] {cat['name'][:32]}")
                     category_list.append({"id": generate_ulid(), "title": cat["name"][:32], "channels": ch_ids})
 
             if category_list:
@@ -480,29 +410,61 @@ async def main():
             step(4, text="Processing roles")
             await process_roles_logic(server, template, target_server_id, bot_token)
 
+            # --- STEP 5: PERMISSIONS (WITH INHERITANCE) ---
             step(5, text="Permissions")
-            channels_with_perms = [ch for ch in textChannels + voiceChannels if ch.get("permission_overwrites") and ch["id"] in IDs["channels"]]
-            for i, ch in enumerate(channels_with_perms):
+            
+            # Map Discord Category ID -> Permission Overwrites (For Inheritance)
+            discord_cat_perms = {cat["id"]: cat.get("permission_overwrites", []) for cat in categories}
+            
+            channels_to_process = [ch for ch in textChannels + voiceChannels if ch["id"] in IDs["channels"]]
+            
+            for i, ch in enumerate(channels_to_process):
                 if i % 10 == 0: log(f"    Setting perms for batch {i}...", end="\r")
-                rID = IDs["channels"][ch["id"]]
-                rChannel = cache["channels"].get(rID)
-                if not rChannel or isinstance(rChannel, RawChannel):
-                    try: rChannel = await client.fetch_channel(rID); cache["channels"][rID] = rChannel
-                    except: continue
                 
+                rID = IDs["channels"][ch["id"]]
+                
+                # Check for explicit overrides, otherwise inherit
+                overwrites = ch.get("permission_overwrites", [])
+                if not overwrites and ch.get("parent_id") in discord_cat_perms:
+                    overwrites = discord_cat_perms[ch["parent_id"]] # Inherit!
+
+                if not overwrites: continue
+
                 template_everyone_id = None
                 for r in template["roles"]:
                     if r["name"] == "@everyone": template_everyone_id = r["id"]; break
                 if not template_everyone_id: template_everyone_id = template.get("id")
 
-                for ow in ch["permission_overwrites"]:
-                    p = {"allow": convert_permission(ow.get("allow",0)), "deny": convert_permission(ow.get("deny",0))}
-                    if ow["id"] == template_everyone_id: await rChannel.set_default_permissions(pyvolt.PermissionOverride(**p))
-                    elif ow["id"] in IDs["roles"]: await rChannel.set_role_permissions(d2r("roles", ow["id"]), **p)
-                time.sleep(0.1) # Fast Pacing
+                for ow in overwrites:
+                    p = {"allow": convert_permission(ow.get("allow",0)).value, "deny": convert_permission(ow.get("deny",0)).value}
+                    role_id_to_set = None
+                    
+                    if ow["id"] == template_everyone_id: role_id_to_set = template_everyone_id # Special flag or handle
+                    elif ow["id"] in IDs["roles"]: role_id_to_set = IDs["roles"][ow["id"]]
+                    
+                    if role_id_to_set:
+                        # Direct API Put to avoid Library complexity
+                        # URL: /channels/{channel}/permissions/{role} or /permissions/default
+                        try:
+                            if role_id_to_set == template_everyone_id:
+                                url = f"https://api.revolt.chat/channels/{rID}/permissions/default"
+                                load = {"permissions": p["allow"] | p["deny"]} # Simplification? No, Revolt sends allow/deny objects
+                                # Actually Revolt uses set_default_permission which takes an object {permissions: X} 
+                                # But we want overrides.
+                                # Let's use the library for the actual complex bit logic if possible, or construct raw.
+                                # Raw payload for role override: { "permissions": { "allow": ..., "deny": ... } }
+                                url = f"https://api.revolt.chat/channels/{rID}/permissions/default"
+                                revolt_api_json("PUT", url, headers={"x-bot-token": bot_token}, payload={"permissions": p})
+                            else:
+                                url = f"https://api.revolt.chat/channels/{rID}/permissions/{role_id_to_set}"
+                                revolt_api_json("PUT", url, headers={"x-bot-token": bot_token}, payload={"permissions": p})
+                        except: pass
+                
+                time.sleep(0.05) 
 
             print("\n✅ Import complete!")
             if skipped > 0: print(f"\n⚠️  {skipped} channels skipped (200 limit).")
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try: asyncio.run(main())
+    except KeyboardInterrupt: print("\n🛑 Exiting."); sys.exit(0)
